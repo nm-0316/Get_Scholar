@@ -1,12 +1,15 @@
 # Google Books PDF取得ツール（Windows向け）
 
+
 Google Books のURLから、次の優先順でPDFを保存します。
+
 
 1. **公式PDFダウンロードリンク**がある場合はそのPDFを保存
 2. リンクがない場合は、**画面表示できるページ画像を収集してPDF化**
 
+
 最新版では、Google側の埋め込み `src`（署名付き画像URL）を優先して取得し、
-`image not available` のようなプレースホルダ画像を、明度分布・エッジ量ベースで判定して除外するよう改善しています。
+`image not available` のようなプレースホルダ画像を除外するよう改善しています。
 
 ## 動作環境
 - Windows 10/11
@@ -33,6 +36,3 @@ pyinstaller --onefile --name gbooks_pdf_fetcher gbooks_pdf_fetcher.py
 ```
 
 生成物: `dist\\gbooks_pdf_fetcher.exe`
-
-
-※ 取得結果がすべてプレースホルダと判定された場合は、誤ったPDFを作らずエラーメッセージを表示して終了します。

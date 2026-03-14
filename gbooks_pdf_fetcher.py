@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
+
+import hashlib
 import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
+
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageFilter, ImageStat
+from PIL import Image
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -101,6 +103,7 @@ def extract_visible_page_ids(html: str) -> list[str]:
     return page_ids[:MAX_PAGES]
 
 
+
 def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]:
     """HTML内に埋め込まれた pid/src マッピングを抽出する。"""
     pattern = re.compile(r'"pid":"([A-Z]{1,3}\d+)"[^\{\}]{0,600}?"src":"([^\"]+)"')
@@ -115,32 +118,16 @@ def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]
 
 
 def looks_like_not_available_image(image_bytes: bytes) -> bool:
-    """`image not available`系プレースホルダらしさを判定。"""
+    """プレースホルダ画像らしさを簡易判定する。"""
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = image.size
-        if width < 80 or height < 80:
+        if width <= 10 or height <= 10:
             return True
 
-        gray = image.convert("L")
-        stat = ImageStat.Stat(gray)
-        mean = stat.mean[0]
-        stddev = stat.stddev[0]
-
-        small = gray.resize((160, 160))
-        pixels = list(small.getdata())
-        total = len(pixels)
-        mid_ratio = sum(150 <= p <= 240 for p in pixels) / total
-        dark_ratio = sum(p < 70 for p in pixels) / total
-
-        edge = small.filter(ImageFilter.FIND_EDGES)
-        edge_mean = ImageStat.Stat(edge).mean[0]
-
-        very_flat_gray = 165 <= mean <= 235 and stddev <= 28
-        low_detail = edge_mean <= 18
-        little_dark_text = dark_ratio < 0.02
-
-        if very_flat_gray and mid_ratio > 0.84 and low_detail and little_dark_text:
+        # 単色/低色数は「image not available」等のプレースホルダであることが多い。
+        palette = image.resize((120, 120)).getcolors(maxcolors=512)
+        if palette and len(palette) <= 6:
             return True
 
         return False
@@ -161,6 +148,7 @@ def fetch_page_image(
             if not looks_like_not_available_image(resp.content):
                 return resp.content
 
+
     query = urlencode(
         {
             "id": book_id,
@@ -168,7 +156,9 @@ def fetch_page_image(
             "img": 1,
             "zoom": 3,
             "hl": "ja",
+
             "w": 1200,
+
         }
     )
     content_url = f"https://{domain}/books/content?{query}"
@@ -180,6 +170,7 @@ def fetch_page_image(
     ctype = resp.headers.get("Content-Type", "").lower()
     if "image" not in ctype:
         return None
+
 
     if looks_like_not_available_image(resp.content):
         return None
@@ -209,32 +200,18 @@ def download_visible_pages_as_pdf(page_url: str, html: str, output_dir: Path) ->
     if not page_ids:
         raise DownloadNotAvailableError("表示ページ情報を抽出できませんでした。")
 
-    embedded_map = extract_embedded_page_image_urls(page_url, html)
-
     domain = urlparse(page_url).netloc
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Referer": page_url})
 
     images: list[bytes] = []
-    hashes: set[str] = set()
     for page_id in page_ids:
-        image_bytes = fetch_page_image(session, domain, book_id, page_id, embedded_map.get(page_id))
+        image_bytes = fetch_page_image(session, domain, book_id, page_id)
         if image_bytes:
-            fingerprint = hashlib.sha256(image_bytes).hexdigest()
-            if fingerprint not in hashes:
-                hashes.add(fingerprint)
-                images.append(image_bytes)
+            images.append(image_bytes)
 
     if not images:
-        raise DownloadNotAvailableError(
-            "取得したページがすべてプレースホルダ画像でした。"
-            "閲覧可能なページを直接表示できるURLか、公式PDFリンクを確認してください。"
-        )
-
-    if len(images) == 1 and len(page_ids) > 1:
-        raise DownloadNotAvailableError(
-            "同一画像しか取得できませんでした。閲覧可能ページの取得が制限されている可能性があります。"
-        )
+        raise DownloadNotAvailableError("表示可能ページの画像を取得できませんでした。")
 
     output_path = output_dir / f"{book_id}_preview_pages.pdf"
     return save_images_as_pdf(images, output_path)
