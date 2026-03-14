@@ -1,9 +1,15 @@
 # Google Books PDF取得ツール（Windows向け）
 
-Google Books のURLから、以下の優先順でPDFを保存します。
+
+Google Books のURLから、次の優先順でPDFを保存します。
+
 
 1. **公式PDFダウンロードリンク**がある場合はそのPDFを保存
 2. リンクがない場合は、**画面表示できるページ画像を収集してPDF化**
+
+
+最新版では、Google側の埋め込み `src`（署名付き画像URL）を優先して取得し、
+`image not available` のようなプレースホルダ画像を除外するよう改善しています。
 
 ## 動作環境
 - Windows 10/11

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import io
+
+import hashlib
 import re
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+
 
 import requests
 from bs4 import BeautifulSoup
@@ -100,7 +103,52 @@ def extract_visible_page_ids(html: str) -> list[str]:
     return page_ids[:MAX_PAGES]
 
 
-def fetch_page_image(session: requests.Session, domain: str, book_id: str, page_id: str) -> bytes | None:
+
+def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]:
+    """HTML内に埋め込まれた pid/src マッピングを抽出する。"""
+    pattern = re.compile(r'"pid":"([A-Z]{1,3}\d+)"[^\{\}]{0,600}?"src":"([^\"]+)"')
+    page_map: dict[str, str] = {}
+    for page_id, raw_src in pattern.findall(html):
+        src = raw_src.replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+        src = src.replace("\\", "")
+        if "/books/content" not in src:
+            continue
+        page_map[page_id] = urljoin(page_url, src)
+    return page_map
+
+
+def looks_like_not_available_image(image_bytes: bytes) -> bool:
+    """プレースホルダ画像らしさを簡易判定する。"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        width, height = image.size
+        if width <= 10 or height <= 10:
+            return True
+
+        # 単色/低色数は「image not available」等のプレースホルダであることが多い。
+        palette = image.resize((120, 120)).getcolors(maxcolors=512)
+        if palette and len(palette) <= 6:
+            return True
+
+        return False
+    except Exception:
+        return True
+
+
+def fetch_page_image(
+    session: requests.Session,
+    domain: str,
+    book_id: str,
+    page_id: str,
+    embedded_url: str | None = None,
+) -> bytes | None:
+    if embedded_url:
+        resp = session.get(embedded_url, timeout=TIMEOUT)
+        if resp.status_code == 200 and "image" in resp.headers.get("Content-Type", "").lower():
+            if not looks_like_not_available_image(resp.content):
+                return resp.content
+
+
     query = urlencode(
         {
             "id": book_id,
@@ -108,6 +156,9 @@ def fetch_page_image(session: requests.Session, domain: str, book_id: str, page_
             "img": 1,
             "zoom": 3,
             "hl": "ja",
+
+            "w": 1200,
+
         }
     )
     content_url = f"https://{domain}/books/content?{query}"
@@ -118,6 +169,10 @@ def fetch_page_image(session: requests.Session, domain: str, book_id: str, page_
 
     ctype = resp.headers.get("Content-Type", "").lower()
     if "image" not in ctype:
+        return None
+
+
+    if looks_like_not_available_image(resp.content):
         return None
 
     return resp.content
