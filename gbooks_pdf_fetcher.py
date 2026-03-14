@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import io
+
 import hashlib
 import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+
 
 import requests
 from bs4 import BeautifulSoup
@@ -101,6 +103,7 @@ def extract_visible_page_ids(html: str) -> list[str]:
     return page_ids[:MAX_PAGES]
 
 
+
 def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]:
     """HTML内に埋め込まれた pid/src マッピングを抽出する。"""
     pattern = re.compile(r'"pid":"([A-Z]{1,3}\d+)"[^\{\}]{0,600}?"src":"([^\"]+)"')
@@ -145,6 +148,7 @@ def fetch_page_image(
             if not looks_like_not_available_image(resp.content):
                 return resp.content
 
+
     query = urlencode(
         {
             "id": book_id,
@@ -152,7 +156,9 @@ def fetch_page_image(
             "img": 1,
             "zoom": 3,
             "hl": "ja",
+
             "w": 1200,
+
         }
     )
     content_url = f"https://{domain}/books/content?{query}"
@@ -164,6 +170,7 @@ def fetch_page_image(
     ctype = resp.headers.get("Content-Type", "").lower()
     if "image" not in ctype:
         return None
+
 
     if looks_like_not_available_image(resp.content):
         return None
@@ -193,29 +200,18 @@ def download_visible_pages_as_pdf(page_url: str, html: str, output_dir: Path) ->
     if not page_ids:
         raise DownloadNotAvailableError("表示ページ情報を抽出できませんでした。")
 
-    embedded_map = extract_embedded_page_image_urls(page_url, html)
-
     domain = urlparse(page_url).netloc
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Referer": page_url})
 
     images: list[bytes] = []
-    hashes: set[str] = set()
     for page_id in page_ids:
-        image_bytes = fetch_page_image(session, domain, book_id, page_id, embedded_map.get(page_id))
+        image_bytes = fetch_page_image(session, domain, book_id, page_id)
         if image_bytes:
-            fingerprint = hashlib.sha256(image_bytes).hexdigest()
-            if fingerprint not in hashes:
-                hashes.add(fingerprint)
-                images.append(image_bytes)
+            images.append(image_bytes)
 
     if not images:
         raise DownloadNotAvailableError("表示可能ページの画像を取得できませんでした。")
-
-    if len(images) == 1 and len(page_ids) > 1:
-        raise DownloadNotAvailableError(
-            "同一画像しか取得できませんでした。閲覧可能ページの取得が制限されている可能性があります。"
-        )
 
     output_path = output_dir / f"{book_id}_preview_pages.pdf"
     return save_images_as_pdf(images, output_path)
