@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageStat
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -171,21 +171,126 @@ def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]
 
 
 def looks_like_not_available_image(image_bytes: bytes) -> bool:
-    """プレースホルダ画像らしさを簡易判定する。"""
+    """プレースホルダ画像らしさを簡易判定する。
+
+    判定基準:
+    1. 極端に小さい (≤10px)
+    2. 低色数 (≤6色) — 完全単色プレースホルダ
+    3. 高輝度 + 低分散 — 白/薄グレー背景にグレーテキストの "image not available" パターン
+    """
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = image.size
         if width <= 10 or height <= 10:
             return True
 
-        # 単色/低色数は「image not available」等のプレースホルダであることが多い。
-        palette = image.resize((120, 120)).getcolors(maxcolors=512)
+        small = image.resize((120, 120))
+
+        # 低色数チェック（完全単色プレースホルダ）
+        palette = small.getcolors(maxcolors=512)
         if palette and len(palette) <= 6:
+            return True
+
+        # 輝度統計チェック — "image not available" はほぼ白地にグレーテキスト
+        # → 平均輝度が高く、かつ標準偏差が低い（コントラストが少ない）
+        gray = small.convert("L")
+        stat = ImageStat.Stat(gray)
+        mean_brightness = stat.mean[0]   # 0=黒, 255=白
+        stddev = stat.stddev[0]
+
+        if mean_brightness > 215 and stddev < 25:
             return True
 
         return False
     except Exception:
         return True
+
+
+def _find_playwright_chromium() -> str | None:
+    """Playwright キャッシュから Chromium 実行ファイルを自動検出する。"""
+    cache_dir = Path.home() / ".cache" / "ms-playwright"
+    if not cache_dir.exists():
+        return None
+    for pattern, binary in [
+        ("chromium_headless_shell-*", "chrome-linux/headless_shell"),
+        ("chromium-*", "chrome-linux/chrome"),
+    ]:
+        for d in sorted(cache_dir.glob(pattern), reverse=True):
+            exe = d / binary
+            if exe.exists():
+                return str(exe)
+    return None
+
+
+def _browser_fetch_page_image(
+    browser_context,  # playwright.sync_api.BrowserContext
+    domain: str,
+    book_id: str,
+    page_id: str,
+) -> bytes | None:
+    """Playwright ヘッドレスブラウザを使ってページ画像を取得する。
+
+    Google Books ビューワーを実際にレンダリングして認証済みセッションで
+    画像URLを取得するため、直接HTTPフェッチでは弾かれる画像も取得できる。
+    """
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeout
+    except ImportError:
+        return None
+
+    viewer_url = f"https://{domain}/books?id={book_id}&pg={page_id}&hl=ja"
+    bpage = browser_context.new_page()
+    try:
+        try:
+            bpage.goto(viewer_url, wait_until="networkidle", timeout=30_000)
+        except PWTimeout:
+            bpage.wait_for_timeout(3_000)
+
+        # ビューワー内の /books/content を指す img 要素を探す
+        img_locator = bpage.locator("img[src*='/books/content']")
+        count = img_locator.count()
+        for i in range(count):
+            el = img_locator.nth(i)
+            try:
+                if not el.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            src = el.get_attribute("src")
+            if not src or "/books/content" not in src:
+                continue
+
+            # zoom・幅パラメータを高解像度に上書き
+            parsed_src = urlparse(src)
+            src_params = {k: v[0] for k, v in parse_qs(parsed_src.query).items()}
+            src_params.update({"zoom": "3", "w": "1200"})
+            high_res_src = parsed_src._replace(query=urlencode(src_params)).geturl()
+
+            # ブラウザの Cookie を使って取得（認証済みセッション）
+            try:
+                resp = browser_context.request.get(high_res_src, timeout=TIMEOUT * 1000)
+                if resp.ok:
+                    body = resp.body()
+                    if body and not looks_like_not_available_image(body):
+                        return body
+            except Exception:
+                pass
+
+            # フォールバック: img 要素のスクリーンショット
+            try:
+                screenshot = el.screenshot()
+                if screenshot and not looks_like_not_available_image(screenshot):
+                    return screenshot
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+    finally:
+        bpage.close()
+
+    return None
 
 
 def fetch_page_image(
@@ -194,13 +299,13 @@ def fetch_page_image(
     book_id: str,
     page_id: str,
     embedded_url: str | None = None,
+    browser_context=None,
 ) -> bytes | None:
     if embedded_url:
         resp = session.get(embedded_url, timeout=TIMEOUT)
         if resp.status_code == 200 and "image" in resp.headers.get("Content-Type", "").lower():
             if not looks_like_not_available_image(resp.content):
                 return resp.content
-
 
     query = urlencode(
         {
@@ -209,26 +314,22 @@ def fetch_page_image(
             "img": 1,
             "zoom": 3,
             "hl": "ja",
-
             "w": 1200,
-
         }
     )
     content_url = f"https://{domain}/books/content?{query}"
 
     resp = session.get(content_url, timeout=TIMEOUT)
-    if resp.status_code != 200:
-        return None
+    if resp.status_code == 200:
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "image" in ctype and not looks_like_not_available_image(resp.content):
+            return resp.content
 
-    ctype = resp.headers.get("Content-Type", "").lower()
-    if "image" not in ctype:
-        return None
+    # 直接フェッチが失敗またはプレースホルダ → ブラウザ経由にフォールバック
+    if browser_context is not None:
+        return _browser_fetch_page_image(browser_context, domain, book_id, page_id)
 
-
-    if looks_like_not_available_image(resp.content):
-        return None
-
-    return resp.content
+    return None
 
 
 def save_images_as_pdf(images: list[bytes], output_path: Path) -> Path:
@@ -253,26 +354,61 @@ def download_visible_pages_as_pdf(page_url: str, html: str, output_dir: Path) ->
     if not page_ids:
         raise DownloadNotAvailableError("表示ページ情報を抽出できませんでした。")
 
-    # HTML に埋め込まれたページ画像URLをあらかじめ取得しておく
     embedded_url_map = extract_embedded_page_image_urls(page_url, html)
-
     domain = urlparse(page_url).netloc
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Referer": page_url})
 
-    images: list[bytes] = []
-    consecutive_failures = 0
-    for page_id in page_ids:
-        embedded_url = embedded_url_map.get(page_id)
-        image_bytes = fetch_page_image(session, domain, book_id, page_id, embedded_url)
-        if image_bytes:
-            images.append(image_bytes)
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            # 連続して取得失敗が続く場合、それ以降は存在しないと判断して打ち切る
-            if consecutive_failures >= 5:
-                break
+    # Playwright ブラウザコンテキストをセットアップ（失敗してもスキップ）
+    _playwright_inst = _browser_inst = browser_ctx = None
+    try:
+        from playwright.sync_api import sync_playwright
+        _playwright_inst = sync_playwright().start()
+        _chromium_exe = _find_playwright_chromium()
+        _launch_kwargs: dict = {"headless": True}
+        if _chromium_exe:
+            _launch_kwargs["executable_path"] = _chromium_exe
+        _browser_inst = _playwright_inst.chromium.launch(**_launch_kwargs)
+        browser_ctx = _browser_inst.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+            locale="ja-JP",
+        )
+        # ビューワーを事前ロードしてセッション Cookie を確立
+        _init = browser_ctx.new_page()
+        try:
+            _init.goto(page_url, wait_until="domcontentloaded", timeout=20_000)
+        except Exception:
+            pass
+        finally:
+            _init.close()
+        print("  ブラウザフォールバック: Playwright (Chromium) 初期化完了")
+    except Exception as exc:
+        print(f"  ブラウザフォールバック: Playwright 利用不可 ({exc})")
+
+    try:
+        images: list[bytes] = []
+        consecutive_failures = 0
+        for page_id in page_ids:
+            embedded_url = embedded_url_map.get(page_id)
+            image_bytes = fetch_page_image(
+                session, domain, book_id, page_id, embedded_url, browser_ctx
+            )
+            if image_bytes:
+                images.append(image_bytes)
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                # 連続失敗が続く場合、それ以降のページは存在しないと判断して打ち切る
+                if consecutive_failures >= 5:
+                    break
+    finally:
+        if browser_ctx:
+            browser_ctx.close()
+        if _browser_inst:
+            _browser_inst.close()
+        if _playwright_inst:
+            _playwright_inst.stop()
 
     if not images:
         raise DownloadNotAvailableError("表示可能ページの画像を取得できませんでした。")
