@@ -23,6 +23,9 @@ USER_AGENT = (
 TIMEOUT = 20
 MAX_PAGES = 300
 
+# Google Books API v1 エンドポイント
+GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
+
 
 class DownloadNotAvailableError(RuntimeError):
     """取得可能データが見つからない場合の例外。"""
@@ -40,6 +43,42 @@ def extract_book_id(page_url: str) -> str:
     if not book_id:
         raise ValueError("URLから書籍ID(id=...)を抽出できませんでした。")
     return book_id
+
+
+def check_google_books_api(book_id: str) -> dict | None:
+    """Google Books API v1 で書籍情報・PDF入手可否を確認する。
+
+    Returns:
+        dict with keys:
+            'pdf_available': bool
+            'epub_available': bool
+            'access_info': dict (raw accessInfo from API)
+            'title': str
+        or None if API call fails.
+    """
+    try:
+        url = f"{GOOGLE_BOOKS_API_URL}/{book_id}"
+        resp = requests.get(url, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        access_info = data.get("accessInfo", {})
+        pdf_info = access_info.get("pdf", {})
+        epub_info = access_info.get("epub", {})
+        volume_info = data.get("volumeInfo", {})
+
+        result = {
+            "title": volume_info.get("title", ""),
+            "pdf_available": pdf_info.get("isAvailable", False),
+            "pdf_download_link": pdf_info.get("downloadLink"),
+            "epub_available": epub_info.get("isAvailable", False),
+            "epub_download_link": epub_info.get("downloadLink"),
+            "viewability": access_info.get("viewability", "NO_PAGES"),
+            "access_info": access_info,
+        }
+        return result
+    except Exception:
+        return None
 
 
 def find_official_pdf_link(page_url: str, html: str) -> str | None:
@@ -96,12 +135,26 @@ def download_pdf_file(url: str, output_dir: Path) -> Path:
 
 
 def extract_visible_page_ids(html: str) -> list[str]:
-    """HTML内に埋め込まれたページID(pg=PA1 等)を抽出。"""
+    """HTML内に埋め込まれたページID(pg=PA1 等)を抽出。
+
+    抽出できなかった場合は連番の標準的なページIDリストを返す。
+    """
     raw_ids = set(re.findall(r'"pid":"([A-Z]{1,3}\d+)"', html))
     fallback_ids = set(re.findall(r'"(PA\d+|PP\d+|PR\d+|PT\d+)"', html))
     page_ids = sorted(raw_ids | fallback_ids, key=lambda x: (x[:2], int(re.sub(r"\D", "", x) or 0)))
-    return page_ids[:MAX_PAGES]
 
+    if page_ids:
+        return page_ids[:MAX_PAGES]
+
+    # HTML から抽出できない場合は標準的な連番ページIDを生成する
+    sequential_ids: list[str] = []
+    # 前付け (PP: Preliminary Pages)
+    sequential_ids += [f"PP{i}" for i in range(1, 11)]
+    # 前付けローマ数字 (PR: PRe-publication pages)
+    sequential_ids += [f"PR{i}" for i in range(1, 21)]
+    # 本文ページ (PA: PAges)
+    sequential_ids += [f"PA{i}" for i in range(1, MAX_PAGES - 30)]
+    return sequential_ids[:MAX_PAGES]
 
 
 def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]:
@@ -200,15 +253,26 @@ def download_visible_pages_as_pdf(page_url: str, html: str, output_dir: Path) ->
     if not page_ids:
         raise DownloadNotAvailableError("表示ページ情報を抽出できませんでした。")
 
+    # HTML に埋め込まれたページ画像URLをあらかじめ取得しておく
+    embedded_url_map = extract_embedded_page_image_urls(page_url, html)
+
     domain = urlparse(page_url).netloc
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Referer": page_url})
 
     images: list[bytes] = []
+    consecutive_failures = 0
     for page_id in page_ids:
-        image_bytes = fetch_page_image(session, domain, book_id, page_id)
+        embedded_url = embedded_url_map.get(page_id)
+        image_bytes = fetch_page_image(session, domain, book_id, page_id, embedded_url)
         if image_bytes:
             images.append(image_bytes)
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            # 連続して取得失敗が続く場合、それ以降は存在しないと判断して打ち切る
+            if consecutive_failures >= 5:
+                break
 
     if not images:
         raise DownloadNotAvailableError("表示可能ページの画像を取得できませんでした。")
@@ -219,8 +283,9 @@ def download_visible_pages_as_pdf(page_url: str, html: str, output_dir: Path) ->
 
 def main() -> int:
     print("Google Books 取得ツール（合法利用専用）")
-    print("1) 公式PDFリンクがあればそれを保存")
-    print("2) リンクがなければ、表示可能ページ画像をPDF化")
+    print("1) Google Books API でPDF入手可否を確認")
+    print("2) 公式PDFリンクがあればそれを保存")
+    print("3) リンクがなければ、表示可能ページ画像をPDF化")
 
     page_url = input("Google Books URLを入力してください: ").strip()
     if not page_url:
@@ -229,20 +294,49 @@ def main() -> int:
 
     try:
         page_url = normalize_google_books_url(page_url)
+        book_id = extract_book_id(page_url)
+
+        # --- ステップ1: Google Books API で確認 ---
+        print(f"\n書籍ID: {book_id}")
+        print("Google Books API で書籍情報を確認中...")
+        api_info = check_google_books_api(book_id)
+        if api_info:
+            print(f"タイトル: {api_info['title']}")
+            print(f"  PDF入手可能: {api_info['pdf_available']}")
+            print(f"  EPUB入手可能: {api_info['epub_available']}")
+            print(f"  閲覧権限: {api_info['viewability']}")
+
+            if api_info["pdf_available"] and api_info["pdf_download_link"]:
+                print(f"  PDF直接ダウンロードリンク: {api_info['pdf_download_link']}")
+        else:
+            print("  Google Books API から情報を取得できませんでした（続行します）。")
+
         resp = requests.get(page_url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
         resp.raise_for_status()
 
-        pdf_url = find_official_pdf_link(page_url, resp.text)
         output_dir = Path("downloads")
 
+        # --- ステップ2: 公式PDFリンクの検索 ---
+        pdf_url = find_official_pdf_link(page_url, resp.text)
+
+        # API から得たダウンロードリンクを優先的に試みる
+        if not pdf_url and api_info and api_info.get("pdf_download_link"):
+            pdf_url = api_info["pdf_download_link"]
+
         if pdf_url:
-            print(f"公式PDFリンク候補: {pdf_url}")
-            output = download_pdf_file(pdf_url, output_dir)
-            print(f"公式PDFを保存: {output.resolve()}")
-        else:
-            print("公式PDFリンクが見つからないため、表示可能ページをPDF化します。")
-            output = download_visible_pages_as_pdf(page_url, resp.text, output_dir)
-            print(f"プレビューPDFを保存: {output.resolve()}")
+            print(f"\n公式PDFリンク候補: {pdf_url}")
+            try:
+                output = download_pdf_file(pdf_url, output_dir)
+                print(f"公式PDFを保存: {output.resolve()}")
+                return 0
+            except RuntimeError as err:
+                print(f"公式PDFのダウンロードに失敗しました: {err}")
+                print("表示可能ページをPDF化する方法に切り替えます。")
+
+        # --- ステップ3: 表示可能ページのPDF化 ---
+        print("\n表示可能ページをPDF化します...")
+        output = download_visible_pages_as_pdf(page_url, resp.text, output_dir)
+        print(f"プレビューPDFを保存: {output.resolve()}")
 
         return 0
 
