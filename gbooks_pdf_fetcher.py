@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageStat
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -171,16 +171,34 @@ def extract_embedded_page_image_urls(page_url: str, html: str) -> dict[str, str]
 
 
 def looks_like_not_available_image(image_bytes: bytes) -> bool:
-    """プレースホルダ画像らしさを簡易判定する。"""
+    """プレースホルダ画像らしさを簡易判定する。
+
+    判定基準:
+    1. 極端に小さい (≤10px)
+    2. 低色数 (≤6色) — 完全単色プレースホルダ
+    3. 高輝度 + 低分散 — 白/薄グレー背景にグレーテキストの "image not available" パターン
+    """
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = image.size
         if width <= 10 or height <= 10:
             return True
 
-        # 単色/低色数は「image not available」等のプレースホルダであることが多い。
-        palette = image.resize((120, 120)).getcolors(maxcolors=512)
+        small = image.resize((120, 120))
+
+        # 低色数チェック（完全単色プレースホルダ）
+        palette = small.getcolors(maxcolors=512)
         if palette and len(palette) <= 6:
+            return True
+
+        # 輝度統計チェック — "image not available" はほぼ白地にグレーテキスト
+        # → 平均輝度が高く、かつ標準偏差が低い（コントラストが少ない）
+        gray = small.convert("L")
+        stat = ImageStat.Stat(gray)
+        mean_brightness = stat.mean[0]   # 0=黒, 255=白
+        stddev = stat.stddev[0]
+
+        if mean_brightness > 215 and stddev < 25:
             return True
 
         return False
